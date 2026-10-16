@@ -1,0 +1,115 @@
+package client
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"net"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/zelport/zelport-sdk-go/protocol"
+	"github.com/zelport/zelport-relay/relay"
+)
+
+func TestCatalogLifecycleLatency(t *testing.T) {
+	for _, count := range []int{2, 5, 20} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			token, group := bytes.Repeat([]byte{5}, 32), bytes.Repeat([]byte{6}, 32)
+			relayServer, err := relay.New(relay.Options{AccessToken: token})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer relayServer.Close()
+			server := httptest.NewServer(relayServer)
+			defer server.Close()
+			clients := make([]*Client, count)
+			registries := make([]*registry, count)
+			for i := range clients {
+				clients[i], registries[i] = newTestClient(t, "ws"+server.URL[4:], token, group)
+			}
+			id := clients[0].opts.Identity.ID
+			await := func(predicate func(protocol.Record) bool) {
+				t.Helper()
+				until := time.Now().Add(8 * time.Second)
+				for {
+					complete := true
+					for _, c := range clients {
+						found := false
+						s := c.Snapshot()
+						for _, r := range s.Records {
+							if r.DeviceID == id && predicate(r) {
+								found = true
+							}
+						}
+						if !found || !s.Connected {
+							complete = false
+						}
+					}
+					if complete {
+						return
+					}
+					if time.Now().After(until) {
+						t.Fatal("catalog propagation timeout")
+					}
+					time.Sleep(time.Millisecond)
+				}
+			}
+			await(func(r protocol.Record) bool { return len(r.Services) == 1 })
+			reg := registries[0]
+			reg.mu.Lock()
+			services := append([]protocol.Service(nil), reg.record.Services...)
+			services[0].Domain = "renamed.localhost"
+			reg.record.Services = services
+			reg.mu.Unlock()
+			start := time.Now()
+			clients[0].Notify()
+			await(func(r protocol.Record) bool {
+				return len(r.Services) == 1 && r.Services[0].Domain == "renamed.localhost"
+			})
+			renamed := time.Since(start)
+			reg.mu.Lock()
+			reg.record.Publish = false
+			reg.record.Services = nil
+			reg.enabled = false
+			reg.mu.Unlock()
+			start = time.Now()
+			clients[0].Notify()
+			await(func(r protocol.Record) bool { return !r.Publish && len(r.Services) == 0 })
+			revoked := time.Since(start)
+			reg.mu.Lock()
+			reg.record.Publish = true
+			reg.record.Services = services
+			reg.enabled = true
+			reg.mu.Unlock()
+			clients[0].Notify()
+			await(func(r protocol.Record) bool { return r.Publish && len(r.Services) == 1 })
+			var offer protocol.Record
+			for _, r := range clients[1].Snapshot().Records {
+				if r.DeviceID == id {
+					offer = r
+				}
+			}
+			ref := protocol.Import{Group: offer.Group, DeviceID: id, ProviderKey: offer.PublicKey, ServiceID: services[0].ID}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			conn, err := clients[1].Open(ctx, ref, protocol.OpenRequest{Kind: protocol.Application, ServiceID: ref.ServiceID, Authority: "renamed.localhost:8080"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+			start = time.Now()
+			clients[0].Close()
+			_, err = conn.Read(make([]byte, 1))
+			if err == nil {
+				t.Fatal("stream survived disconnect")
+			}
+			if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+				t.Fatal("disconnect did not close stream")
+			}
+			t.Logf("devices=%d rename_ms=%.3f withdrawal_ms=%.3f disconnect_ms=%.3f", count, float64(renamed.Microseconds())/1000, float64(revoked.Microseconds())/1000, float64(time.Since(start).Microseconds())/1000)
+		})
+	}
+}

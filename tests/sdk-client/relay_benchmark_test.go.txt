@@ -1,0 +1,393 @@
+//go:build darwin || linux
+
+package client
+
+import (
+	"context"
+	"crypto/ecdh"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"runtime/pprof"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/zelport/zelport-sdk-go/protocol"
+	"github.com/zelport/zelport-relay/relay"
+)
+
+type relayBenchMetrics struct {
+	In, Out, Reads, Writes        uint64
+	CPU                           float64
+	Heap, Allocations, AllocBytes uint64
+	Goroutines                    int
+}
+type relayBenchInfo struct {
+	URL, Metrics string
+	Certificate  []byte
+}
+type relayBenchConfig struct {
+	Token      []byte
+	TLS        bool
+	ProfileDir string
+}
+type countedListener struct {
+	net.Listener
+	in, out, reads, writes atomic.Uint64
+}
+type countedConn struct {
+	net.Conn
+	owner *countedListener
+}
+
+func (l *countedListener) Accept() (net.Conn, error) {
+	c, e := l.Listener.Accept()
+	if e != nil {
+		return nil, e
+	}
+	return &countedConn{c, l}, nil
+}
+func (c *countedConn) Read(p []byte) (int, error) {
+	n, e := c.Conn.Read(p)
+	c.owner.in.Add(uint64(n))
+	c.owner.reads.Add(1)
+	return n, e
+}
+func (c *countedConn) Write(p []byte) (int, error) {
+	n, e := c.Conn.Write(p)
+	c.owner.out.Add(uint64(n))
+	c.owner.writes.Add(1)
+	return n, e
+}
+
+// TestRelayBenchmarkWorker is a separate relay process, only launched by the benchmark.
+func TestRelayBenchmarkWorker(t *testing.T) {
+	dir := os.Getenv("ZELPORT_BENCH_WORKER")
+	if dir == "" {
+		t.Skip("benchmark subprocess only")
+	}
+	raw, e := os.ReadFile(filepath.Join(dir, "config.json"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	var cfg relayBenchConfig
+	if e = json.Unmarshal(raw, &cfg); e != nil {
+		t.Fatal(e)
+	}
+	r, e := relay.New(relay.Options{AccessToken: cfg.Token})
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer r.Close()
+	server := httptest.NewUnstartedServer(r)
+	counted := &countedListener{Listener: server.Listener}
+	server.Listener = counted
+	if cfg.TLS {
+		server.StartTLS()
+	} else {
+		server.Start()
+	}
+	defer server.Close()
+	var cpuProfile *os.File
+	var profileMu sync.Mutex
+	metrics := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		profileMu.Lock()
+		defer profileMu.Unlock()
+		if req.URL.Path == "/profile/start" && cfg.ProfileDir != "" {
+			var err error
+			cpuProfile, err = os.Create(filepath.Join(cfg.ProfileDir, "cpu.pprof"))
+			if err == nil {
+				err = pprof.StartCPUProfile(cpuProfile)
+			}
+			if err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			w.WriteHeader(204)
+			return
+		}
+		if req.URL.Path == "/profile/stop" && cpuProfile != nil {
+			pprof.StopCPUProfile()
+			cpuProfile.Close()
+			cpuProfile = nil
+			runtime.GC()
+			f, err := os.Create(filepath.Join(cfg.ProfileDir, "allocs.pprof"))
+			if err == nil {
+				err = pprof.Lookup("allocs").WriteTo(f, 0)
+				f.Close()
+			}
+			if err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			w.WriteHeader(204)
+			return
+		}
+		var usage syscall.Rusage
+		syscall.Getrusage(syscall.RUSAGE_SELF, &usage)
+		var mem runtime.MemStats
+		runtime.ReadMemStats(&mem)
+		cpu := float64(usage.Utime.Sec+usage.Stime.Sec) + float64(usage.Utime.Usec+usage.Stime.Usec)/1e6
+		json.NewEncoder(w).Encode(relayBenchMetrics{counted.in.Load(), counted.out.Load(), counted.reads.Load(), counted.writes.Load(), cpu, mem.HeapAlloc, mem.Mallocs, mem.TotalAlloc, runtime.NumGoroutine()})
+	}))
+	defer metrics.Close()
+	info := relayBenchInfo{URL: "ws" + server.URL[4:], Metrics: metrics.URL}
+	if cfg.TLS {
+		info.Certificate = server.Certificate().Raw
+	}
+	raw, _ = json.Marshal(info)
+	if e = os.WriteFile(filepath.Join(dir, "ready.json"), raw, 0600); e != nil {
+		t.Fatal(e)
+	}
+	select {}
+}
+func benchmarkRelay(b *testing.B, encrypted bool) (relayBenchInfo, []byte, *http.Client) {
+	b.Helper()
+	dir := b.TempDir()
+	token := make([]byte, 32)
+	rand.Read(token)
+	cfg := relayBenchConfig{Token: token, TLS: encrypted}
+	if root := os.Getenv("ZELPORT_BENCH_PROFILE_DIR"); root != "" {
+		cfg.ProfileDir = filepath.Join(root, strings.ReplaceAll(b.Name(), "/", "_"))
+		if e := os.MkdirAll(cfg.ProfileDir, 0700); e != nil {
+			b.Fatal(e)
+		}
+	}
+	raw, _ := json.Marshal(cfg)
+	if e := os.WriteFile(filepath.Join(dir, "config.json"), raw, 0600); e != nil {
+		b.Fatal(e)
+	}
+	command := exec.Command(os.Args[0], "-test.run=^TestRelayBenchmarkWorker$")
+	command.Env = append(os.Environ(), "ZELPORT_BENCH_WORKER="+dir)
+	log, e := os.Create(filepath.Join(dir, "worker.log"))
+	if e != nil {
+		b.Fatal(e)
+	}
+	command.Stdout = log
+	command.Stderr = log
+	if e = command.Start(); e != nil {
+		b.Fatal(e)
+	}
+	b.Cleanup(func() { command.Process.Kill(); command.Wait(); log.Close() })
+	var info relayBenchInfo
+	until := time.Now().Add(10 * time.Second)
+	for {
+		raw, e = os.ReadFile(filepath.Join(dir, "ready.json"))
+		if e == nil && json.Unmarshal(raw, &info) == nil {
+			break
+		}
+		if time.Now().After(until) {
+			b.Fatal("relay worker startup timeout")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	if encrypted {
+		cert, e := x509.ParseCertificate(info.Certificate)
+		if e != nil {
+			b.Fatal(e)
+		}
+		roots := x509.NewCertPool()
+		roots.AddCert(cert)
+		transport.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
+	}
+	b.Cleanup(transport.CloseIdleConnections)
+	return info, token, &http.Client{Transport: transport}
+}
+
+type httpBenchRegistry struct {
+	*registry
+	address string
+}
+
+func (r *httpBenchRegistry) Open(ctx context.Context, _ protocol.PeerContext, _ protocol.OpenRequest) (net.Conn, error) {
+	return (&net.Dialer{}).DialContext(ctx, "tcp", r.address)
+}
+func benchmarkClient(b *testing.B, url string, token, group []byte, httpClient *http.Client, address string, serviceCounts ...int) (*Client, *httpBenchRegistry) {
+	b.Helper()
+	key, e := ecdh.X25519().GenerateKey(rand.Reader)
+	if e != nil {
+		b.Fatal(e)
+	}
+	id := protocol.ID()
+	reg := &httpBenchRegistry{&registry{enabled: true, record: protocol.Record{Version: protocol.Version, DeviceID: id, Hostname: "benchmark", PublicKey: base64.RawURLEncoding.EncodeToString(key.PublicKey().Bytes()), Port: 8080, Publish: true, Services: []protocol.Service{{Kind: protocol.Application, ID: protocol.ID(), Domain: "benchmark.localhost"}}}}, address}
+	if len(serviceCounts) > 0 {
+		reg.record.Services = nil
+		for i := 0; i < serviceCounts[0]; i++ {
+			reg.record.Services = append(reg.record.Services, protocol.Service{Kind: protocol.Application, ID: protocol.ID(), Domain: fmt.Sprintf("service-%d.localhost", i)})
+		}
+	}
+	c, e := New(Options{RelayURL: url, AccessToken: token, GroupToken: group, Identity: protocol.Identity{ID: id, PrivateKey: key.Bytes()}, Registry: reg, HTTPClient: httpClient})
+	if e != nil {
+		b.Fatal(e)
+	}
+	go c.Run(context.Background())
+	b.Cleanup(func() { c.Close() })
+	return c, reg
+}
+func relayMetrics(b *testing.B, url string) relayBenchMetrics {
+	b.Helper()
+	response, e := http.Get(url)
+	if e != nil {
+		b.Fatal(e)
+	}
+	defer response.Body.Close()
+	var m relayBenchMetrics
+	if e = json.NewDecoder(response.Body).Decode(&m); e != nil {
+		b.Fatal(e)
+	}
+	return m
+}
+
+// BenchmarkRelayHTTP includes HTTP, TCP, WS/WSS, admission Noise, peer Noise,
+// yamux and a TCP HTTP backend. Relay process counters exclude both clients.
+func BenchmarkRelayHTTP(b *testing.B) {
+	for _, encrypted := range []bool{false, true} {
+		name := "WS"
+		if encrypted {
+			name = "WSS"
+		}
+		for _, size := range []int{1024, 1 << 20} {
+			for _, parallel := range []int{1, 8} {
+				b.Run(fmt.Sprintf("%s/%dB/concurrency%d", name, size, parallel), func(b *testing.B) {
+					payload := make([]byte, size)
+					rand.Read(payload)
+					backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						w.Header().Set("Content-Type", "application/octet-stream")
+						w.Header().Set("Content-Length", fmt.Sprint(size))
+						w.Write(payload)
+					}))
+					b.Cleanup(backend.Close)
+					info, token, wsHTTP := benchmarkRelay(b, encrypted)
+					group := make([]byte, 32)
+					rand.Read(group)
+					provider, reg := benchmarkClient(b, info.URL, token, group, wsHTTP, backend.Listener.Addr().String())
+					consumer, _ := benchmarkClient(b, info.URL, token, group, wsHTTP, backend.Listener.Addr().String())
+					var offer protocol.Record
+					until := time.Now().Add(10 * time.Second)
+					for {
+						for _, r := range consumer.Snapshot().Records {
+							if r.DeviceID == provider.opts.Identity.ID {
+								offer = r
+							}
+						}
+						if offer.DeviceID != "" && consumer.Snapshot().Connected && provider.Snapshot().Connected {
+							break
+						}
+						if time.Now().After(until) {
+							b.Fatal("catalog timeout")
+						}
+						time.Sleep(10 * time.Millisecond)
+					}
+					ref := protocol.Import{Group: offer.Group, DeviceID: offer.DeviceID, ProviderKey: offer.PublicKey, ServiceID: reg.record.Services[0].ID}
+					transport := &http.Transport{DisableKeepAlives: true, DisableCompression: true, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+						return consumer.Open(ctx, ref, protocol.OpenRequest{Kind: protocol.Application, ServiceID: ref.ServiceID, Authority: "benchmark.localhost:8080"})
+					}}
+					defer transport.CloseIdleConnections()
+					httpClient := &http.Client{Transport: transport, Timeout: 30 * time.Second}
+					request := func() error {
+						r, e := httpClient.Get("http://benchmark.localhost:8080/")
+						if e != nil {
+							return e
+						}
+						defer r.Body.Close()
+						n, e := io.Copy(io.Discard, r.Body)
+						if e != nil {
+							return e
+						}
+						if r.StatusCode != 200 || n != int64(size) {
+							return fmt.Errorf("invalid response %d/%d", r.StatusCode, n)
+						}
+						return nil
+					}
+					// Establish admission and peer sessions outside the steady-state timing.
+					if e := request(); e != nil {
+						b.Fatal(e)
+					}
+					if os.Getenv("ZELPORT_BENCH_PROFILE_DIR") != "" {
+						benchmarkProfile(b, info.Metrics, "start")
+					}
+					latencies := make([]int64, b.N)
+					before := relayMetrics(b, info.Metrics)
+					start := time.Now()
+					b.SetBytes(int64(size))
+					b.ReportAllocs()
+					b.ResetTimer()
+					var next atomic.Int64
+					done := make(chan error, parallel)
+					for i := 0; i < parallel; i++ {
+						go func() {
+							for {
+								index := next.Add(1) - 1
+								if index >= int64(b.N) {
+									done <- nil
+									return
+								}
+								requestStart := time.Now()
+								if e := request(); e != nil {
+									done <- e
+									return
+								}
+								latencies[index] = time.Since(requestStart).Nanoseconds()
+							}
+						}()
+					}
+					for i := 0; i < parallel; i++ {
+						if e := <-done; e != nil {
+							b.Fatal(e)
+						}
+					}
+					b.StopTimer()
+					elapsed := time.Since(start).Seconds()
+					after := relayMetrics(b, info.Metrics)
+					if os.Getenv("ZELPORT_BENCH_PROFILE_DIR") != "" {
+						benchmarkProfile(b, info.Metrics, "stop")
+					}
+					sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+					b.ReportMetric(float64(latencies[(len(latencies)-1)*50/100])/1e6, "latency-p50-ms")
+					b.ReportMetric(float64(latencies[(len(latencies)-1)*95/100])/1e6, "latency-p95-ms")
+					bodyBytes := float64(b.N) * float64(size)
+					b.ReportMetric((after.CPU-before.CPU)/elapsed, "relay-CPU-cores")
+					b.ReportMetric(float64(after.In-before.In)/bodyBytes, "relay-in/B")
+					b.ReportMetric(float64(after.Out-before.Out)/bodyBytes, "relay-out/B")
+					b.ReportMetric(float64(after.Reads-before.Reads)/float64(b.N), "relay-reads/op")
+					b.ReportMetric(float64(after.Writes-before.Writes)/float64(b.N), "relay-writes/op")
+					b.ReportMetric(float64(after.Allocations-before.Allocations)/float64(b.N), "relay-allocs/op")
+					b.ReportMetric(float64(after.AllocBytes-before.AllocBytes)/float64(b.N), "relay-alloc-B/op")
+					b.ReportMetric(float64(after.Heap)/(1<<20), "relay-heap-MiB")
+				})
+			}
+		}
+	}
+}
+
+// Profile runs are separate from performance comparisons. Calibration overwrites
+// earlier profiles; allocation profiles include worker startup and warm-up.
+func benchmarkProfile(b *testing.B, url, action string) {
+	b.Helper()
+	response, err := http.Post(url+"/profile/"+action, "", nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		b.Fatalf("profile %s: %s", action, response.Status)
+	}
+}

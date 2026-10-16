@@ -1,0 +1,297 @@
+package client
+
+import (
+	"bytes"
+	"context"
+	"crypto/ecdh"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
+	"github.com/zelport/zelport-sdk-go/protocol"
+	"github.com/zelport/zelport-relay/relay"
+	"github.com/zelport/zelport-sdk-go/secure"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
+	"testing"
+	"time"
+)
+
+func newTestClient(t *testing.T, url string, token, group []byte, httpClients ...*http.Client) (*Client, *registry) {
+	t.Helper()
+	key, _ := ecdh.X25519().GenerateKey(rand.Reader)
+	id := protocol.ID()
+	r := &registry{enabled: true, record: protocol.Record{Version: protocol.Version, DeviceID: id, Hostname: "same-host", PublicKey: base64.RawURLEncoding.EncodeToString(key.PublicKey().Bytes()), Port: 8080, Publish: true, Services: []protocol.Service{{Kind: protocol.Application, ID: protocol.ID(), Domain: "test.localhost"}}}}
+	var httpClient *http.Client
+	if len(httpClients) > 0 {
+		httpClient = httpClients[0]
+	}
+	c, e := New(Options{HTTPClient: httpClient, RelayURL: url, AccessToken: token, GroupToken: group, Identity: protocol.Identity{ID: id, PrivateKey: key.Bytes()}, Registry: r})
+	if e != nil {
+		t.Fatal(e)
+	}
+	go c.Run(context.Background())
+	t.Cleanup(func() { c.Close() })
+	return c, r
+}
+
+func TestClientTunnelAndLiveAuthorization(t *testing.T) {
+	token, group := bytes.Repeat([]byte{1}, 32), bytes.Repeat([]byte{2}, 32)
+	s, _ := relay.New(relay.Options{AccessToken: token})
+	server := httptest.NewServer(s)
+	t.Cleanup(func() { s.Close(); server.Close() })
+	a, _ := newTestClient(t, "ws"+server.URL[4:], token, group)
+	b, reg := newTestClient(t, "ws"+server.URL[4:], token, group)
+	deadline := time.Now().Add(5 * time.Second)
+	var offer protocol.Record
+	for time.Now().Before(deadline) {
+		status := a.Snapshot()
+		// Initial catalog entries are visible before runConnection marks the client ready.
+		for _, v := range status.Records {
+			if v.DeviceID == b.opts.Identity.ID {
+				offer = v
+			}
+		}
+		if offer.DeviceID != "" && status.Connected {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if offer.DeviceID == "" {
+		t.Fatal("catalog missing")
+	}
+	ref := protocol.Import{Group: offer.Group, DeviceID: offer.DeviceID, ServiceID: offer.Services[0].ID, ProviderKey: offer.PublicKey}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, e := a.Open(ctx, ref, protocol.OpenRequest{Kind: protocol.Application, ServiceID: ref.ServiceID, Authority: "test.localhost:8080"})
+	if e != nil {
+		t.Fatal(e)
+	}
+	conn.SetDeadline(time.Now().Add(time.Second))
+	if _, e = conn.Write([]byte("E2E")); e != nil {
+		t.Fatal(e)
+	}
+	v := make([]byte, 3)
+	if _, e = io.ReadFull(conn, v); e != nil || string(v) != "E2E" {
+		t.Fatal(e, string(v))
+	}
+	conn.Close()
+	reg.mu.Lock()
+	reg.enabled = false
+	reg.mu.Unlock()
+	if c, e := a.Open(ctx, ref, protocol.OpenRequest{Kind: protocol.Application, ServiceID: ref.ServiceID, Authority: "test.localhost:8080"}); e == nil {
+		c.Close()
+		t.Fatal("catalog authorized withdrawn service")
+	}
+}
+
+
+func TestWSSReverseProxy(t *testing.T) {
+	token, group := bytes.Repeat([]byte{3}, 32), bytes.Repeat([]byte{4}, 32)
+	s, _ := relay.New(relay.Options{AccessToken: token})
+	defer s.Close()
+	server := httptest.NewServer(s)
+	defer server.Close()
+	target, _ := url.Parse(server.URL)
+	proxy := httptest.NewTLSServer(httputil.NewSingleHostReverseProxy(target))
+	defer proxy.Close()
+	c, _ := newTestClient(t, "wss"+proxy.URL[5:], token, group, proxy.Client())
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if c.Snapshot().Connected {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal(c.Snapshot().Error)
+}
+
+func TestClientCanceledOpen(t *testing.T) {
+	token := bytes.Repeat([]byte{1}, 32)
+	s, _ := relay.New(relay.Options{AccessToken: token})
+	defer s.Close()
+	server := httptest.NewServer(s)
+	defer server.Close()
+	c, _ := newTestClient(t, "ws"+server.URL[4:], token, token)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if conn, e := c.Open(ctx, protocol.Import{}, protocol.OpenRequest{}); e == nil {
+		conn.Close()
+		t.Fatal("canceled open succeeded")
+	}
+}
+
+
+func TestBadCatalogRecordDoesNotDisconnectHealthyProvider(t *testing.T) {
+	token, group := bytes.Repeat([]byte{11}, 32), bytes.Repeat([]byte{12}, 32)
+	s, _ := relay.New(relay.Options{AccessToken: token})
+	server := httptest.NewServer(s)
+	t.Cleanup(func() { s.Close(); server.Close() })
+	a, _ := newTestClient(t, "ws"+server.URL[4:], token, group)
+	b, _ := newTestClient(t, "ws"+server.URL[4:], token, group)
+	var offer protocol.Record
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, v := range a.Snapshot().Records {
+			if v.DeviceID == b.opts.Identity.ID {
+				offer = v
+			}
+		}
+		if offer.DeviceID != "" && a.Snapshot().Connected {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if offer.DeviceID == "" {
+		t.Fatal("missing provider")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, e := a.Open(ctx, protocol.Import{Group: offer.Group, DeviceID: offer.DeviceID, ServiceID: offer.Services[0].ID, ProviderKey: offer.PublicKey}, protocol.OpenRequest{Kind: protocol.Application, ServiceID: offer.Services[0].ID, Authority: "test.localhost:8080"})
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer conn.Close()
+	// Feed a complete catalog reply with a signed but future-dated unrelated record.
+	locator, _ := secure.Derive(group, "group-locator")
+	bad := offer
+	bad.DeviceID = protocol.ID()
+	bad.Group = hex.EncodeToString(locator[:])
+	bad.IssuedAt = time.Now().Unix() + 30
+	bad.ExpiresAt = bad.IssuedAt + 60
+	raw, _ := secure.SealCatalog(bad, group)
+	x, y := net.Pipe()
+	defer x.Close()
+	defer y.Close()
+	ctl := &control{conn: x, pending: map[string]chan protocol.Message{}, done: make(chan struct{})}
+	go a.readControl(ctl)
+	go func() {
+		var req protocol.Message
+		protocol.ReadJSON(y, &req)
+		protocol.WriteJSON(y, protocol.Message{Type: "record", ID: req.ID, Record: raw})
+		protocol.WriteJSON(y, protocol.Message{Type: "result", ID: req.ID})
+	}()
+	if e = a.catalog(ctl); e != nil {
+		t.Fatal("unrelated invalid record failed catalog", e)
+	}
+	if !a.Snapshot().Connected || a.Snapshot().Error == "" {
+		t.Fatal("rejection must be visible without disconnection")
+	}
+	conn.SetDeadline(time.Now().Add(time.Second))
+	if _, e = conn.Write([]byte("ok")); e != nil {
+		t.Fatal(e)
+	}
+	var got [2]byte
+	if _, e = io.ReadFull(conn, got[:]); e != nil || string(got[:]) != "ok" {
+		t.Fatal(e)
+	}
+}
+
+
+func TestOpenRelayStillSeparatesE2EGroups(t *testing.T) {
+	s, e := relay.New(relay.Options{AllowUnauthenticated: true})
+	if e != nil {
+		t.Fatal(e)
+	}
+	server := httptest.NewServer(s)
+	t.Cleanup(func() { s.Close(); server.Close() })
+	a, _ := newTestClient(t, "ws"+server.URL[4:], nil, bytes.Repeat([]byte{1}, 32))
+	b, _ := newTestClient(t, "ws"+server.URL[4:], nil, bytes.Repeat([]byte{2}, 32))
+	deadline := time.Now().Add(5 * time.Second)
+	for !a.Snapshot().Connected || !b.Snapshot().Connected {
+		if time.Now().After(deadline) {
+			t.Fatal("open clients did not connect")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	for _, c := range []*Client{a, b} {
+		for _, record := range c.Snapshot().Records {
+			if record.DeviceID != c.opts.Identity.ID {
+				t.Fatal("other E2E group leaked into catalog")
+			}
+		}
+	}
+	invalid := a.opts
+	invalid.GroupToken = nil
+	if _, e := New(invalid); e == nil {
+		t.Fatal("empty E2E secret accepted")
+	}
+}
+
+
+func TestRejectedPublicationPreservesSession(t *testing.T) {
+	token, group := bytes.Repeat([]byte{1}, 32), bytes.Repeat([]byte{2}, 32)
+	s, _ := relay.New(relay.Options{AccessToken: token})
+	server := httptest.NewServer(s)
+	t.Cleanup(func() { s.Close(); server.Close() })
+	a, _ := newTestClient(t, "ws"+server.URL[4:], token, group)
+	b, reg := newTestClient(t, "ws"+server.URL[4:], token, group)
+	deadline := time.Now().Add(5 * time.Second)
+	var offer protocol.Record
+	for {
+		for _, v := range a.Snapshot().Records {
+			if v.DeviceID == b.opts.Identity.ID {
+				offer = v
+			}
+		}
+		if offer.DeviceID != "" && a.Snapshot().Connected && len(b.Snapshot().Records) == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("catalog unavailable")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	ref := protocol.Import{Group: offer.Group, DeviceID: offer.DeviceID, ProviderKey: offer.PublicKey, ServiceID: offer.Services[0].ID}
+	conn, e := a.Open(context.Background(), ref, protocol.OpenRequest{Kind: protocol.Application, ServiceID: ref.ServiceID, Authority: "test.localhost:8080"})
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer conn.Close()
+	b.mu.Lock()
+	original := b.ctl
+	b.mu.Unlock()
+	reg.mu.Lock()
+	saved := reg.record.Services
+	reg.record.Services = make([]protocol.Service, 257)
+	reg.mu.Unlock()
+	b.Notify()
+	deadline = time.Now().Add(time.Second)
+	for b.Snapshot().Error == "" {
+		if time.Now().After(deadline) {
+			t.Fatal("no publication warning")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !b.Snapshot().Connected {
+		t.Fatal("invalid local publication disconnected healthy client")
+	}
+	b.mu.Lock()
+	same := b.ctl == original
+	b.mu.Unlock()
+	if !same {
+		t.Fatal("control replaced")
+	}
+	conn.SetDeadline(time.Now().Add(time.Second))
+	if _, e = conn.Write([]byte("kept")); e != nil {
+		t.Fatal(e)
+	}
+	got := make([]byte, 4)
+	if _, e = io.ReadFull(conn, got); e != nil || string(got) != "kept" {
+		t.Fatal("active session lost", e)
+	}
+	reg.mu.Lock()
+	reg.record.Services = saved
+	reg.mu.Unlock()
+	b.Notify()
+	deadline = time.Now().Add(time.Second)
+	for b.Snapshot().Error != "" {
+		if time.Now().After(deadline) {
+			t.Fatal("publication did not recover", b.Snapshot().Error)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
