@@ -19,7 +19,7 @@ func TestRelayServesOnlyV1Endpoint(t *testing.T) {
 	}
 	defer s.Close()
 
-	for _, path := range []string{"/v0/ws", "/v2/ws", "/v3/ws"} {
+	for _, path := range []string{"/v0/ws", "/v2/ws", "/v99/ws"} {
 		t.Run(path, func(t *testing.T) {
 			request := httptest.NewRequest(http.MethodGet, path, nil)
 			response := httptest.NewRecorder()
