@@ -1,11 +1,11 @@
 # zelport-relay
 
-Reusable relay server and standalone CLI, extracted from the former Snitzel project. Preview API and standalone server.
+Reusable Relay Protocol v1 server and standalone CLI.
 
 The public `relay` package owns the server and listener lifecycle. Both the
-standalone `cmd/zelport-relay` and the gateway's `built_in_relay` module use this
-same implementation. It depends on `github.com/zelport/zelport-sdk-go` and never
-receives the E2E secret. There is no cloud management/provisioning API here.
+standalone `cmd/zelport-relay` and Zelport App's `built_in_relay` module use this
+same implementation. It depends on `github.com/zelport/zelport-sdk-go` and
+provides relay transport and admission only.
 
 Run `make build` and then `./bin/zelport-relay --help`. Admission remains explicit:
 
@@ -17,8 +17,8 @@ ZELPORT_RELAY_ALLOW_PUBLIC_ACCESS=true ./bin/zelport-relay --listen :8090
 The CLI uses `ZELPORT_RELAY_*` environment names and Zelport display text. Public access only changes admission; E2E secrets are
 still required by clients. Default listen address remains `127.0.0.1:8090`.
 
-`make check` runs race tests and vet. `make check-integration` also runs original
-SDK white-box tests against a real server; see [test harness](tests/sdk-client/README.md).
+`make check` runs race tests and vet. `make check-integration` also runs SDK
+client tests against a real server; see [test harness](tests/sdk-client/README.md).
 Tagged dependencies are resolved directly by Go. For the integration harness,
 set `ZELPORT_RELAY_VERSION` to the published relay version being tested.
 
