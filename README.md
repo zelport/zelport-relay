@@ -44,6 +44,4 @@ The embeddable relay library does not enforce a process identity policy; the
 host application owns it. Admission settings use `ZELPORT_RELAY_*` variables; the root override uses
 `ZELPORT_RELAY_ALLOW_ROOT`.
 
-See [upgrade instructions](docs/UPGRADING.md) when switching an existing installation to Zelport.
-
 Licensed under the [MIT License](LICENSE).
