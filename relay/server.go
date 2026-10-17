@@ -93,7 +93,7 @@ func (s *Server) Close() error {
 	return nil
 }
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/v3/ws" || r.Method != "GET" {
+	if r.URL.Path != protocol.RelayEndpoint || r.Method != "GET" {
 		http.NotFound(w, r)
 		return
 	}

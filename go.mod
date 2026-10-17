@@ -9,6 +9,6 @@ require (
 
 require (
 	github.com/coder/websocket v1.8.15
-	github.com/zelport/zelport-sdk-go v0.1.0-preview.2
+	github.com/zelport/zelport-sdk-go v0.10.0
 	golang.org/x/sys v0.49.0
 )

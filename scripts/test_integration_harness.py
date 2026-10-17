@@ -18,7 +18,7 @@ class IntegrationHarnessTests(unittest.TestCase):
             marker = work / 'copy-attempted'
             cp.write_text('#!/bin/sh\ntouch "$COPY_MARKER"\nexit 91\n')
             cp.chmod(0o700)
-            env = dict(os.environ, GO=str(go), ZELPORT_RELAY_VERSION='v0.0.0-test',
+            env = dict(os.environ, GO=str(go), ZELPORT_RELAY_VERSION='v0.0.0',
                        PATH=str(work)+os.pathsep+os.environ['PATH'], COPY_MARKER=str(marker))
             result = subprocess.run(['sh', str(SCRIPT)], env=env, capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)

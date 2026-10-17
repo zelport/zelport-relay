@@ -26,7 +26,7 @@ func TestCatalogKnownCiphertext(t *testing.T) {
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
-	envelope := protocol.CatalogEnvelope{Version: 3, Group: string(bytes.Repeat([]byte("a"), 64)), RouteID: string(bytes.Repeat([]byte("b"), 64)), Nonce: make([]byte, 24), Ciphertext: make([]byte, 16)}
+	envelope := protocol.CatalogEnvelope{Version: 1, Group: string(bytes.Repeat([]byte("a"), 64)), RouteID: string(bytes.Repeat([]byte("b"), 64)), Nonce: make([]byte, 24), Ciphertext: make([]byte, 16)}
 	raw, _ := protocol.EncodeCatalogEnvelope(envelope)
 	request := func(message map[string]any) (int, string) {
 		t.Helper()

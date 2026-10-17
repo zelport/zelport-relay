@@ -6,10 +6,37 @@ import (
 	"github.com/zelport/zelport-sdk-go/protocol"
 	"github.com/zelport/zelport-sdk-go/transport"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 )
+
+func TestRelayServesOnlyV1Endpoint(t *testing.T) {
+	s, err := New(Options{AllowUnauthenticated: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	for _, path := range []string{"/v0/ws", "/v2/ws", "/v3/ws"} {
+		t.Run(path, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, path, nil)
+			response := httptest.NewRecorder()
+			s.ServeHTTP(response, request)
+			if response.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want %d", response.Code, http.StatusNotFound)
+			}
+		})
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/ws", nil)
+	response := httptest.NewRecorder()
+	s.ServeHTTP(response, request)
+	if response.Code == http.StatusNotFound {
+		t.Fatal("current relay endpoint returned 404")
+	}
+}
 
 func TestRelayRequiresAdmission(t *testing.T) {
 	s, e := New(Options{AccessToken: bytes.Repeat([]byte{1}, 32)})
@@ -30,7 +57,7 @@ func TestRelayDuplicateRegistration(t *testing.T) {
 	defer s.Close()
 	server := httptest.NewServer(s)
 	defer server.Close()
-	raw, _ := protocol.EncodeCatalogEnvelope(protocol.CatalogEnvelope{Version: 3, Group: string(bytes.Repeat([]byte("a"), 64)), RouteID: string(bytes.Repeat([]byte("b"), 64)), Nonce: make([]byte, 24), Ciphertext: make([]byte, 16)})
+	raw, _ := protocol.EncodeCatalogEnvelope(protocol.CatalogEnvelope{Version: 1, Group: string(bytes.Repeat([]byte("a"), 64)), RouteID: string(bytes.Repeat([]byte("b"), 64)), Nonce: make([]byte, 24), Ciphertext: make([]byte, 16)})
 	for i := 0; i < 2; i++ {
 		c, e := transport.Dial(context.Background(), "ws"+server.URL[4:], token, "control")
 		if e != nil {
