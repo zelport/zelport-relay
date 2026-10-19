@@ -22,6 +22,18 @@ client tests against a real server; see [test harness](tests/sdk-client/README.m
 Tagged dependencies are resolved directly by Go. For the integration harness,
 set `ZELPORT_RELAY_VERSION` to the published relay version being tested.
 
+## Release
+
+After pushing the verified tag, create its GitHub release with generated notes:
+
+```sh
+tag=vMAJOR.MINOR.PATCH
+gh release create "$tag" --repo zelport/zelport-relay \
+  --verify-tag --generate-notes \
+  --title "Zelport Relay $tag" \
+  --notes "Standalone relay server for end-to-end encrypted connections between Zelport App instances."
+```
+
 ## Running as root
 
 On macOS and Linux, `zelport-relay` refuses effective UID 0 by default. Run it as
