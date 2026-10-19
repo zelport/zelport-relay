@@ -47,3 +47,8 @@ publication, including generated source bundles.
 
 Preserve the existing repository-local Git author and committer configuration
 unless the user explicitly requests a change.
+
+Use canonical `vMAJOR.MINOR.PATCH` release identifiers in documentation,
+operator inputs, Go module versions, tags, GitHub Releases and reports. Derived
+binary and artifact fields may omit the prefix only when their format requires
+it; do not present that payload as a Relay release identifier.
